@@ -275,4 +275,78 @@ const char* ExtractHolder::operator()(ExecutionContext* ctx, const char* user_in
   return result_buffer;
 }
 
+Result<std::shared_ptr<RegexpLikeHolder>> RegexpLikeHolder::Make(
+    const FunctionNode& node) {
+  ARROW_RETURN_IF(
+      node.children().size() < 2,
+      Status::Invalid("'regexp_like' function requires at least two parameters"));
+  auto pattern = dynamic_cast<LiteralNode*>(node.children().at(1).get());
+  ARROW_RETURN_IF(
+      pattern == nullptr,
+      Status::Invalid(
+          "'regexp_like' function requires a literal as the second parameter"));
+
+  auto pattern_type = pattern->return_type()->id();
+  ARROW_RETURN_IF(
+      !(pattern_type == arrow::Type::STRING || pattern_type == arrow::Type::BINARY),
+      Status::Invalid(
+          "'regexp_like' function requires a string literal as the second parameter"));
+
+  if (node.children().size() > 2) {
+    auto parameter = dynamic_cast<LiteralNode*>(node.children().at(2).get());
+    if (parameter != nullptr) {
+      auto parameter_type = parameter->return_type()->id();
+      ARROW_RETURN_IF(
+          !(parameter_type == arrow::Type::STRING ||
+            parameter_type == arrow::Type::BINARY),
+          Status::Invalid(
+              "'regexp_like' function requires a string literal as the third parameter"));
+      return RegexpLikeHolder::Make(std::get<std::string>(pattern->holder()), true,
+                                    std::get<std::string>(parameter->holder()));
+    }
+  }
+  return RegexpLikeHolder::Make(std::get<std::string>(pattern->holder()), false, "");
+}
+
+Result<std::shared_ptr<RegexpLikeHolder>> RegexpLikeHolder::Make(
+    const std::string& regex_pattern, bool used_match_parameter,
+    const std::string& match_parameter) {
+  RE2::Options regex_op;
+  // set re2 use posix regex expression which also called ERE in postgre sql
+  regex_op.set_posix_syntax(true);
+  // oracle's regex_like will default treat source str as single line
+  regex_op.set_one_line(true);
+
+  if (used_match_parameter) {
+    for (auto& parameter : match_parameter) {
+      switch (parameter) {
+        case 'i':
+          regex_op.set_case_sensitive(false);
+          break;
+        case 'c':
+          regex_op.set_case_sensitive(true);
+          break;
+        case 'n':
+          regex_op.set_dot_nl(true);
+          break;
+        case 'm':
+          regex_op.set_one_line(false);
+          break;
+        default:
+          ARROW_RETURN_NOT_OK(Status::Invalid("Parameter only support 'i','c','n','m'!"));
+      }
+    }
+  }
+
+  std::shared_ptr<RegexpLikeHolder> lholder;
+
+  lholder =
+      std::shared_ptr<RegexpLikeHolder>(new RegexpLikeHolder(regex_pattern, regex_op));
+
+  ARROW_RETURN_IF(!lholder->regex_.ok(),
+                  Status::Invalid("Building posix regex pattern '", regex_pattern,
+                                  "' failed with: ", lholder->regex_.error()));
+  return lholder;
+}
+
 }  // namespace gandiva

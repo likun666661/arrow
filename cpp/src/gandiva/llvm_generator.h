@@ -127,6 +127,8 @@ class GANDIVA_EXPORT LLVMGenerator {
     void Visit(const InExprDexBase<std::string>& dex) override;
     template <typename Type>
     void VisitInExpression(const InExprDexBase<Type>& dex);
+    void Visit(const PreEvalInExprDex& dex) override;
+    void Visit(const ReadProxyDex& dex) override;
 
     LValuePtr result() { return result_; }
 
@@ -182,6 +184,7 @@ class GANDIVA_EXPORT LLVMGenerator {
     llvm::Value* arg_context_ptr_;
     llvm::Value* loop_var_;
     bool has_arena_allocs_;
+    LValuePtr read_proxy_result_;
   };
 
   // Generate the code for one expression for default mode, with the output of

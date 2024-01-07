@@ -431,6 +431,7 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
   // Loop exit
   builder->SetInsertPoint(loop_exit);
   builder->CreateRet(types()->i32_constant(0));
+  // module()->print(llvm::outs(), nullptr);
   return Status::OK();
 }
 
@@ -1151,6 +1152,26 @@ void LLVMGenerator::Visitor::Visit(const InExprDexBase<gandiva::DecimalScalar128
 
 void LLVMGenerator::Visitor::Visit(const InExprDexBase<std::string>& dex) {
   VisitInExpression<std::string>(dex);
+}
+
+void LLVMGenerator::Visitor::Visit(const PreEvalInExprDex& dex) {
+  auto eval_expr = dex.eval_expr_vv()->value_expr();
+  eval_expr->Accept(*this);
+  read_proxy_result_ = result();
+  auto condition_eval_expr = dex.condition_eval_expr_vv()->value_expr();
+  condition_eval_expr->Accept(*this);
+}
+
+void LLVMGenerator::Visitor::Visit(const ReadProxyDex& dex) {
+  if (is_decimal_128(dex.type())) {
+    auto read_proxy_result_decimal_ =
+        std::static_pointer_cast<DecimalLValue>(read_proxy_result_);
+    result_.reset(new DecimalLValue(
+        read_proxy_result_decimal_->data(), read_proxy_result_decimal_->validity(),
+        read_proxy_result_decimal_->precision(), read_proxy_result_decimal_->scale()));
+  } else {
+    result_.reset(new LValue(read_proxy_result_->data(), read_proxy_result_->length()));
+  }
 }
 
 LValuePtr LLVMGenerator::Visitor::BuildIfElse(llvm::Value* condition,

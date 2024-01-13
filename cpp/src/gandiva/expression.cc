@@ -22,4 +22,6 @@ namespace gandiva {
 
 std::string Expression::ToString() { return root()->ToString(); }
 
+size_t Expression::HashCode() {return root()->HashCode();}
+
 }  // namespace gandiva

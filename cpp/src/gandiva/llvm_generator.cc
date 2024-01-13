@@ -72,6 +72,7 @@ Status LLVMGenerator::Add(const ExpressionPtr expr, const FieldDescriptorPtr out
   ExprDecomposer decomposer(*function_registry_, annotator_);
   ValueValidityPairPtr value_validity;
   ARROW_RETURN_NOT_OK(decomposer.Decompose(*expr->root(), &value_validity));
+  pre_eval_dexs = decomposer.GetPreEvalExprs();
   // Generate the IR function for the decomposed expression.
   auto compiled_expr = std::make_unique<CompiledExpr>(value_validity, output);
   std::string fn_name = "expr_" + std::to_string(idx) + "_" +
@@ -276,6 +277,7 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
                                        FieldDescriptorPtr output, int suffix_idx,
                                        std::string& fn_name,
                                        SelectionVector::Mode selection_vector_mode) {
+  //_ir_traces_ = true;
   llvm::IRBuilder<>* builder = ir_builder();
   // Create fn prototype :
   //   int expr_1 (long **addrs, long *offsets, long **bitmaps,
@@ -372,9 +374,17 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
         types()->i64_type(), true, "position_var");
   }
 
+
+
   // The visitor can add code to both the entry/loop blocks.
   Visitor visitor(this, fn, loop_entry, arg_addrs, arg_local_bitmaps, arg_holder_ptrs,
                   slice_offsets, arg_context_ptr, position_var);
+  visit_pre_eval_dexs = true;
+  for(auto &validity_value_pair:pre_eval_dexs){
+    validity_value_pair->value_expr()->Accept(visitor);
+  }
+  visit_pre_eval_dexs = false;
+
   value_expr->Accept(visitor);
   LValuePtr output_value = visitor.result();
 
@@ -431,6 +441,7 @@ Status LLVMGenerator::CodeGenExprValue(DexPtr value_expr, int buffer_count,
   // Loop exit
   builder->SetInsertPoint(loop_exit);
   builder->CreateRet(types()->i32_constant(0));
+  //module()->print(llvm::outs(), nullptr);
   return Status::OK();
 }
 
@@ -579,6 +590,11 @@ LLVMGenerator::Visitor::Visitor(LLVMGenerator* generator, llvm::Function* functi
 }
 
 void LLVMGenerator::Visitor::Visit(const VectorReadFixedLenValueDex& dex) {
+  if (auto cache_result = cache_expr_value_results[dex.HashCode()];
+      cache_result != nullptr) {
+    result_ = cache_result;
+    return;
+  }
   llvm::IRBuilder<>* builder = ir_builder();
   auto types = generator_->types();
   llvm::Value* slot_ref = GetBufferReference(dex.DataIdx(), kBufferTypeData, dex.Field());
@@ -590,12 +606,18 @@ void LLVMGenerator::Visitor::Visit(const VectorReadFixedLenValueDex& dex) {
     case arrow::Type::BOOL:
       slot_value = generator_->GetPackedBitValue(slot_ref, slot_index);
       lvalue = std::make_shared<LValue>(slot_value);
+      if(generator_->visit_pre_eval_dexs){
+        cache_expr_value_results[dex.HashCode()] = lvalue;
+      }
       break;
 
     case arrow::Type::DECIMAL: {
       auto slot_offset = builder->CreateGEP(types->i128_type(), slot_ref, slot_index);
       slot_value = builder->CreateLoad(types->i128_type(), slot_offset, dex.FieldName());
       lvalue = generator_->BuildDecimalLValue(slot_value, dex.FieldType());
+      if(generator_->visit_pre_eval_dexs){
+        cache_expr_value_results[dex.HashCode()] = lvalue;
+      }
       break;
     }
 
@@ -604,6 +626,9 @@ void LLVMGenerator::Visitor::Visit(const VectorReadFixedLenValueDex& dex) {
       auto slot_offset = builder->CreateGEP(type, slot_ref, slot_index);
       slot_value = builder->CreateLoad(type, slot_offset, dex.FieldName());
       lvalue = std::make_shared<LValue>(slot_value);
+      if(generator_->visit_pre_eval_dexs){
+        cache_expr_value_results[dex.HashCode()] = lvalue;
+      }
       break;
     }
   }
@@ -613,6 +638,11 @@ void LLVMGenerator::Visitor::Visit(const VectorReadFixedLenValueDex& dex) {
 }
 
 void LLVMGenerator::Visitor::Visit(const VectorReadVarLenValueDex& dex) {
+  if (auto cache_result = cache_expr_value_results[dex.HashCode()];
+      cache_result != nullptr) {
+    result_ = cache_result;
+    return;
+  }
   llvm::IRBuilder<>* builder = ir_builder();
   llvm::Value* slot;
   auto types = generator_->types();
@@ -644,10 +674,18 @@ void LLVMGenerator::Visitor::Visit(const VectorReadVarLenValueDex& dex) {
   auto data_value = builder->CreateGEP(types->i8_type(), data_slot_ref, offset_start);
   ADD_VISITOR_TRACE("visit var-len data vector " + dex.FieldName() + " len %T",
                     len_value);
-  result_.reset(new LValue(data_value, len_value));
+  auto lvalue = std::make_shared<LValue>(data_value, len_value);
+  if(generator_->visit_pre_eval_dexs){
+    cache_expr_value_results[dex.HashCode()] = lvalue;
+  }
+  result_ = lvalue;
 }
 
 void LLVMGenerator::Visitor::Visit(const VectorReadValidityDex& dex) {
+  if (auto validity_ptr = cache_expr_validity_results[dex.HashCode()];
+      validity_ptr != nullptr) {
+    result_ = validity_ptr;
+  }
   llvm::IRBuilder<>* builder = ir_builder();
   llvm::Value* slot_ref =
       GetBufferReference(dex.ValidityIdx(), kBufferTypeValidity, dex.Field());
@@ -657,9 +695,16 @@ void LLVMGenerator::Visitor::Visit(const VectorReadValidityDex& dex) {
 
   ADD_VISITOR_TRACE("visit validity vector " + dex.FieldName() + " value %T", validity);
   result_.reset(new LValue(validity));
+  if(generator_->visit_pre_eval_dexs){
+    cache_expr_validity_results[dex.HashCode()] = std::make_shared<LValue>(validity);
+  }
 }
 
 void LLVMGenerator::Visitor::Visit(const LocalBitMapValidityDex& dex) {
+  if (auto validity_ptr = cache_expr_validity_results[dex.HashCode()];
+      validity_ptr != nullptr) {
+    result_ = validity_ptr;
+  }
   llvm::Value* slot_ref = GetLocalBitMapReference(dex.local_bitmap_idx());
   llvm::Value* validity = generator_->GetPackedBitValue(slot_ref, loop_var_);
 
@@ -667,6 +712,9 @@ void LLVMGenerator::Visitor::Visit(const LocalBitMapValidityDex& dex) {
       "visit local bitmap " + std::to_string(dex.local_bitmap_idx()) + " value %T",
       validity);
   result_.reset(new LValue(validity));
+  if(generator_->visit_pre_eval_dexs){
+    cache_expr_validity_results[dex.HashCode()] = std::make_shared<LValue>(validity);
+  }
 }
 
 void LLVMGenerator::Visitor::Visit(const TrueDex& dex) {
@@ -678,6 +726,11 @@ void LLVMGenerator::Visitor::Visit(const FalseDex& dex) {
 }
 
 void LLVMGenerator::Visitor::Visit(const LiteralDex& dex) {
+  if (auto cache_result = cache_expr_value_results[dex.HashCode()];
+      cache_result != nullptr) {
+    result_ = cache_result;
+    return;
+  }
   LLVMTypes* types = generator_->types();
   llvm::Value* value = nullptr;
   llvm::Value* len = nullptr;
@@ -755,6 +808,7 @@ void LLVMGenerator::Visitor::Visit(const LiteralDex& dex) {
       auto lvalue = generator_->BuildDecimalLValue(int128_value, type);
       // set it as the l-value and return.
       result_ = lvalue;
+      cache_expr_value_results[dex.HashCode()] = lvalue;
       return;
     }
 
@@ -762,10 +816,17 @@ void LLVMGenerator::Visitor::Visit(const LiteralDex& dex) {
       DCHECK(0);
   }
   ADD_VISITOR_TRACE("visit Literal %T", value);
+  if(generator_->visit_pre_eval_dexs){
+    cache_expr_value_results[dex.HashCode()] = std::make_shared<LValue>(value, len);
+  }
   result_.reset(new LValue(value, len));
 }
 
 void LLVMGenerator::Visitor::Visit(const NonNullableFuncDex& dex) {
+  if(cache_expr_value_results[dex.HashCode()]){
+    result_ = cache_expr_value_results[dex.HashCode()];
+    return ;
+  }
   const std::string& function_name = dex.func_descriptor()->name();
   ADD_VISITOR_TRACE("visit NonNullableFunc base function " + function_name);
 
@@ -791,6 +852,9 @@ void LLVMGenerator::Visitor::Visit(const NonNullableFuncDex& dex) {
       auto arg_validity = BuildCombinedValidity(pair->validity_exprs());
       is_valid = builder->CreateAnd(is_valid, arg_validity, "validityBitAnd");
     }
+    if(generator_->visit_pre_eval_dexs){
+      cache_expr_validity_results[dex.HashCode()] = std::make_shared<LValue>(is_valid);
+    }
 
     // then block
     auto then_lambda = [&] {
@@ -812,13 +876,24 @@ void LLVMGenerator::Visitor::Visit(const NonNullableFuncDex& dex) {
     };
 
     result_ = BuildIfElse(is_valid, then_lambda, else_lambda, arrow_return_type);
+    if(generator_->visit_pre_eval_dexs){
+      cache_expr_value_results[dex.HashCode()] = result_;
+    }
   } else {
     // fast path : invoke function without computing validities.
     result_ = BuildFunctionCall(native_function, arrow_return_type, &params);
+    if(generator_->visit_pre_eval_dexs){
+      cache_expr_value_results[dex.HashCode()] = result_;
+    }
   }
 }
 
 void LLVMGenerator::Visitor::Visit(const NullableNeverFuncDex& dex) {
+  if (auto cache_result = cache_expr_value_results[dex.HashCode()];
+      cache_result != nullptr) {
+    result_ = cache_result;
+    return;
+  }
   ADD_VISITOR_TRACE("visit NullableNever base function " + dex.func_descriptor()->name());
   const NativeFunction* native_function = dex.native_function();
 
@@ -828,32 +903,43 @@ void LLVMGenerator::Visitor::Visit(const NullableNeverFuncDex& dex) {
 
   auto arrow_return_type = dex.func_descriptor()->return_type();
   result_ = BuildFunctionCall(native_function, arrow_return_type, &params);
+  if(generator_->visit_pre_eval_dexs){
+    cache_expr_value_results[dex.HashCode()]=result_;
+  }
 }
 
 void LLVMGenerator::Visitor::Visit(const NullableInternalFuncDex& dex) {
-  ADD_VISITOR_TRACE("visit NullableInternal base function " +
-                    dex.func_descriptor()->name());
-  llvm::IRBuilder<>* builder = ir_builder();
-  LLVMTypes* types = generator_->types();
+  llvm::Value* result_valid = nullptr;
+  if (auto cache_result = cache_expr_value_results[dex.HashCode()];
+      cache_result != nullptr) {
+    result_ = cache_result;
+    result_valid = cache_expr_validity_results[dex.HashCode()]->data();
+  }else{
+    ADD_VISITOR_TRACE("visit NullableInternal base function " +
+                      dex.func_descriptor()->name());
+    llvm::IRBuilder<>* builder = ir_builder();
+    LLVMTypes* types = generator_->types();
 
-  const NativeFunction* native_function = dex.native_function();
+    const NativeFunction* native_function = dex.native_function();
 
-  // build function params along with validity.
-  auto params = BuildParams(dex.get_holder_idx(), dex.args(), true,
-                            native_function->NeedsContext());
+    // build function params along with validity.
+    auto params = BuildParams(dex.get_holder_idx(), dex.args(), true,
+                              native_function->NeedsContext());
 
-  // add an extra arg for validity (allocated on stack).
-  llvm::AllocaInst* result_valid_ptr =
-      new llvm::AllocaInst(types->i8_type(), 0, "result_valid", entry_block_);
-  params.push_back(result_valid_ptr);
+    // add an extra arg for validity (allocated on stack).
+    llvm::AllocaInst* result_valid_ptr =
+        new llvm::AllocaInst(types->i8_type(), 0, "result_valid", entry_block_);
+    params.push_back(result_valid_ptr);
 
-  auto arrow_return_type = dex.func_descriptor()->return_type();
-  result_ = BuildFunctionCall(native_function, arrow_return_type, &params);
-
-  // load the result validity and truncate to i1.
-  auto result_valid_i8 = builder->CreateLoad(types->i8_type(), result_valid_ptr);
-  llvm::Value* result_valid = builder->CreateTrunc(result_valid_i8, types->i1_type());
-
+    auto arrow_return_type = dex.func_descriptor()->return_type();
+    result_ = BuildFunctionCall(native_function, arrow_return_type, &params);
+    auto result_valid_i8 = builder->CreateLoad(types->i8_type(), result_valid_ptr);
+    result_valid = builder->CreateTrunc(result_valid_i8, types->i1_type());
+    if(generator_->visit_pre_eval_dexs){
+      cache_expr_validity_results[dex.HashCode()] = std::make_shared<LValue>(result_valid);
+      cache_expr_value_results[dex.HashCode()]= result_;
+    }
+  }
   // set validity bit in the local bitmap.
   ClearLocalBitMapIfNotValid(dex.local_bitmap_idx(), result_valid);
 }
@@ -1188,6 +1274,11 @@ LValuePtr LLVMGenerator::Visitor::BuildIfElse(llvm::Value* condition,
   builder->SetInsertPoint(merge_bb);
   auto llvm_type = types->IRType(result_type->id());
   llvm::PHINode* result_value = builder->CreatePHI(llvm_type, 2, "res_value");
+
+  ADD_VISITOR_TRACE("then_lvalue %T", then_lvalue->data());
+  ADD_VISITOR_TRACE("else_lvalue %T", else_lvalue->data());
+
+
   result_value->addIncoming(then_lvalue->data(), then_bb);
   result_value->addIncoming(else_lvalue->data(), else_bb);
 

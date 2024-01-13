@@ -182,6 +182,9 @@ class GANDIVA_EXPORT LLVMGenerator {
     llvm::Value* arg_context_ptr_;
     llvm::Value* loop_var_;
     bool has_arena_allocs_;
+
+    std::unordered_map<size_t,LValuePtr>cache_expr_value_results;
+    std::unordered_map<size_t,LValuePtr>cache_expr_validity_results;
   };
 
   // Generate the code for one expression for default mode, with the output of
@@ -263,6 +266,9 @@ class GANDIVA_EXPORT LLVMGenerator {
   // used for debug
   bool enable_ir_traces_;
   std::vector<std::string> trace_strings_;
+
+  std::vector<ValueValidityPairPtr>pre_eval_dexs;
+  bool visit_pre_eval_dexs;
 };
 
 }  // namespace gandiva

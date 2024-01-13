@@ -40,7 +40,7 @@ class ExpressionCacheKey {
     for (auto& expr : expression_vector) {
       std::string expr_as_string = expr->ToString();
       expressions_as_strings_.push_back(expr_as_string);
-      arrow::internal::hash_combine(result, expr_as_string);
+      arrow::internal::hash_combine(result, expr->HashCode());
       UpdateUniquifier(expr_as_string);
     }
     arrow::internal::hash_combine(result, static_cast<size_t>(mode));

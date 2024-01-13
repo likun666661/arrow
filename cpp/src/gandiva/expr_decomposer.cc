@@ -36,16 +36,25 @@ namespace gandiva {
 
 // Decompose a field node - simply separate out validity & value arrays.
 Status ExprDecomposer::Visit(const FieldNode& node) {
+  auto hash_code = const_cast<FieldNode&>(node).HashCode();
   auto desc = annotator_.CheckAndAddInputFieldDescriptor(node.field());
 
-  DexPtr validity_dex = std::make_shared<VectorReadValidityDex>(desc);
+  DexPtr validity_dex = std::make_shared<VectorReadValidityDex>(hash_code,desc);
   DexPtr value_dex;
   if (desc->HasOffsetsIdx()) {
-    value_dex = std::make_shared<VectorReadVarLenValueDex>(desc);
+    value_dex = std::make_shared<VectorReadVarLenValueDex>(hash_code,desc);
   } else {
-    value_dex = std::make_shared<VectorReadFixedLenValueDex>(desc);
+    value_dex = std::make_shared<VectorReadFixedLenValueDex>(hash_code,desc);
   }
   result_ = std::make_shared<ValueValidityPair>(validity_dex, value_dex);
+  if(hash_set.count(hash_code)){
+    if(!pre_eval_set.count(hash_code)){
+      pre_eval_dexs.push_back(std::make_shared<ValueValidityPair>(validity_dex, value_dex));
+      pre_eval_set.insert(hash_code);
+    }
+  }else{
+    hash_set.insert(hash_code);
+  }
   return Status::OK();
 }
 
@@ -63,6 +72,7 @@ const FunctionNode ExprDecomposer::TryOptimize(const FunctionNode& node) {
 // Decompose a field node - wherever possible, merge the validity vectors of the
 // child nodes.
 Status ExprDecomposer::Visit(const FunctionNode& in_node) {
+  auto hash_code = const_cast<FunctionNode&>(in_node).HashCode();
   auto node = TryOptimize(in_node);
   auto desc = node.descriptor();
   FunctionSignature signature(desc->name(), desc->params(), desc->return_type());
@@ -99,12 +109,12 @@ Status ExprDecomposer::Visit(const FunctionNode& in_node) {
                              decomposed->validity_exprs().end());
     }
 
-    auto value_dex = std::make_shared<NonNullableFuncDex>(desc, native_function, holder,
+    auto value_dex = std::make_shared<NonNullableFuncDex>(hash_code,desc, native_function, holder,
                                                           holder_idx, args);
     result_ = std::make_shared<ValueValidityPair>(merged_validity, value_dex);
   } else if (native_function->result_nullable_type() == kResultNullNever) {
     // These functions always output valid results. So, no validity dex.
-    auto value_dex = std::make_shared<NullableNeverFuncDex>(desc, native_function, holder,
+    auto value_dex = std::make_shared<NullableNeverFuncDex>(hash_code,desc, native_function, holder,
                                                             holder_idx, args);
     result_ = std::make_shared<ValueValidityPair>(value_dex);
   } else {
@@ -112,11 +122,18 @@ Status ExprDecomposer::Visit(const FunctionNode& in_node) {
 
     // Add a local bitmap to track the output validity.
     int local_bitmap_idx = annotator_.AddLocalBitMap();
-    auto validity_dex = std::make_shared<LocalBitMapValidityDex>(local_bitmap_idx);
+    auto validity_dex = std::make_shared<LocalBitMapValidityDex>(hash_code,local_bitmap_idx);
 
-    auto value_dex = std::make_shared<NullableInternalFuncDex>(
+    auto value_dex = std::make_shared<NullableInternalFuncDex>(hash_code,
         desc, native_function, holder, holder_idx, args, local_bitmap_idx);
     result_ = std::make_shared<ValueValidityPair>(validity_dex, value_dex);
+  }
+  if(hash_set.count(hash_code)){
+    auto ret = result_;
+    if(!pre_eval_set.count(hash_code)){
+      pre_eval_dexs.push_back(ret);
+      pre_eval_set.insert(hash_code);
+    }
   }
   return Status::OK();
 }
@@ -125,6 +142,7 @@ Status ExprDecomposer::Visit(const FunctionNode& in_node) {
 Status ExprDecomposer::Visit(const IfNode& node) {
   // nested_if_else_ might get overwritten when visiting the condition-node, so
   // saving the value to a local variable and resetting nested_if_else_ to false
+  auto hash_code = const_cast<IfNode&>(node).HashCode();
   bool svd_nested_if_else = nested_if_else_;
   nested_if_else_ = false;
 
@@ -149,9 +167,9 @@ Status ExprDecomposer::Visit(const IfNode& node) {
   auto else_vv = result();
   bool is_terminal_else = PopElseEntry(node);
 
-  auto validity_dex = std::make_shared<LocalBitMapValidityDex>(local_bitmap_idx);
+  auto validity_dex = std::make_shared<LocalBitMapValidityDex>(hash_code,local_bitmap_idx);
   auto value_dex =
-      std::make_shared<IfDex>(condition_vv, then_vv, else_vv, node.return_type(),
+      std::make_shared<IfDex>(hash_code,condition_vv, then_vv, else_vv, node.return_type(),
                               local_bitmap_idx, is_terminal_else);
 
   result_ = std::make_shared<ValueValidityPair>(validity_dex, value_dex);
@@ -161,6 +179,7 @@ Status ExprDecomposer::Visit(const IfNode& node) {
 // Decompose a BooleanNode
 Status ExprDecomposer::Visit(const BooleanNode& node) {
   // decompose the children.
+  auto hash_code = const_cast<BooleanNode&>(node).HashCode();
   std::vector<ValueValidityPairPtr> args;
   for (auto& child : node.children()) {
     auto status = child->Accept(*this);
@@ -171,15 +190,15 @@ Status ExprDecomposer::Visit(const BooleanNode& node) {
 
   // Add a local bitmap to track the output validity.
   int local_bitmap_idx = annotator_.AddLocalBitMap();
-  auto validity_dex = std::make_shared<LocalBitMapValidityDex>(local_bitmap_idx);
+  auto validity_dex = std::make_shared<LocalBitMapValidityDex>(hash_code,local_bitmap_idx);
 
   std::shared_ptr<BooleanDex> value_dex;
   switch (node.expr_type()) {
     case BooleanNode::AND:
-      value_dex = std::make_shared<BooleanAndDex>(args, local_bitmap_idx);
+      value_dex = std::make_shared<BooleanAndDex>(hash_code,args, local_bitmap_idx);
       break;
     case BooleanNode::OR:
-      value_dex = std::make_shared<BooleanOrDex>(args, local_bitmap_idx);
+      value_dex = std::make_shared<BooleanOrDex>(hash_code,args, local_bitmap_idx);
       break;
   }
   result_ = std::make_shared<ValueValidityPair>(validity_dex, value_dex);
@@ -188,12 +207,13 @@ Status ExprDecomposer::Visit(const BooleanNode& node) {
 
 Status ExprDecomposer::Visit(const InExpressionNode<gandiva::DecimalScalar128>& node) {
   /* decompose the children. */
+  auto hash_code = const_cast<InExpressionNode<gandiva::DecimalScalar128>&>(node).HashCode();
   std::vector<ValueValidityPairPtr> args;
   auto status = node.eval_expr()->Accept(*this);
   ARROW_RETURN_NOT_OK(status);
   args.push_back(result());
   /* In always outputs valid results, so no validity dex */
-  auto value_dex = std::make_shared<InExprDex<gandiva::DecimalScalar128>>(
+  auto value_dex = std::make_shared<InExprDex<gandiva::DecimalScalar128>>(hash_code,
       args, node.values(), node.get_precision(), node.get_scale());
   int holder_idx = annotator_.AddHolderPointer(value_dex->in_holder().get());
   value_dex->set_holder_idx(holder_idx);
@@ -204,12 +224,13 @@ Status ExprDecomposer::Visit(const InExpressionNode<gandiva::DecimalScalar128>& 
 template <typename ctype>
 Status ExprDecomposer::VisitInGeneric(const InExpressionNode<ctype>& node) {
   /* decompose the children. */
+  auto hash_code = const_cast<InExpressionNode<ctype>&>(node).HashCode();
   std::vector<ValueValidityPairPtr> args;
   auto status = node.eval_expr()->Accept(*this);
   ARROW_RETURN_NOT_OK(status);
   args.push_back(result());
   /* In always outputs valid results, so no validity dex */
-  auto value_dex = std::make_shared<InExprDex<ctype>>(args, node.values());
+  auto value_dex = std::make_shared<InExprDex<ctype>>(hash_code,args, node.values());
   int holder_idx = annotator_.AddHolderPointer(value_dex->in_holder().get());
   value_dex->set_holder_idx(holder_idx);
   result_ = std::make_shared<ValueValidityPair>(value_dex);
@@ -237,12 +258,13 @@ Status ExprDecomposer::Visit(const InExpressionNode<std::string>& node) {
 }
 
 Status ExprDecomposer::Visit(const LiteralNode& node) {
-  auto value_dex = std::make_shared<LiteralDex>(node.return_type(), node.holder());
+  auto hash_code = const_cast<LiteralNode&>(node).HashCode();
+  auto value_dex = std::make_shared<LiteralDex>(hash_code,node.return_type(), node.holder());
   DexPtr validity_dex;
   if (node.is_null()) {
-    validity_dex = std::make_shared<FalseDex>();
+    validity_dex = std::make_shared<FalseDex>(hash_code);
   } else {
-    validity_dex = std::make_shared<TrueDex>();
+    validity_dex = std::make_shared<TrueDex>(hash_code);
   }
   result_ = std::make_shared<ValueValidityPair>(validity_dex, value_dex);
   return Status::OK();

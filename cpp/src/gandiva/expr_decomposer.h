@@ -22,6 +22,7 @@
 #include <stack>
 #include <string>
 #include <utility>
+#include <unordered_set>
 
 #include "gandiva/arrow.h"
 #include "gandiva/expression.h"
@@ -47,6 +48,10 @@ class GANDIVA_EXPORT ExprDecomposer : public NodeVisitor {
       *out = std::move(result_);
     }
     return status;
+  }
+
+  std::vector<ValueValidityPairPtr>GetPreEvalExprs(){
+    return pre_eval_dexs;
   }
 
  private:
@@ -126,6 +131,11 @@ class GANDIVA_EXPORT ExprDecomposer : public NodeVisitor {
   std::stack<std::unique_ptr<IfStackEntry>> if_entries_stack_;
   ValueValidityPairPtr result_;
   bool nested_if_else_;
+  std::unordered_set<size_t>hash_set;
+  std::vector<ValueValidityPairPtr>pre_eval_dexs;
+  std::unordered_set<size_t>pre_eval_set;
+
+
 };
 
 }  // namespace gandiva

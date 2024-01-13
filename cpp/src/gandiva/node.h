@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "arrow/status.h"
+#include "arrow/util/hash_util.h"
 
 #include "gandiva/arrow.h"
 #include "gandiva/func_descriptor.h"
@@ -37,7 +38,7 @@ namespace gandiva {
 /// in a joined state.
 class GANDIVA_EXPORT Node {
  public:
-  explicit Node(DataTypePtr return_type) : return_type_(return_type) {}
+  explicit Node(DataTypePtr return_type) : return_type_(return_type),has_eval_hash_code_(false){}
 
   virtual ~Node() = default;
 
@@ -48,8 +49,19 @@ class GANDIVA_EXPORT Node {
 
   virtual std::string ToString() const = 0;
 
+  virtual size_t HashCode() = 0;
+
+  void SetHasEvalHashCode(){
+    has_eval_hash_code_ = true;
+  }
+
+  bool GetHasEvalHashCode(){
+    return has_eval_hash_code_;
+  }
+
  protected:
   DataTypePtr return_type_;
+  bool has_eval_hash_code_;
 };
 
 /// \brief Node in the expression tree, representing a literal.
@@ -99,9 +111,20 @@ class GANDIVA_EXPORT LiteralNode : public Node {
     return ss.str();
   }
 
+  size_t HashCode() override{
+    if(!GetHasEvalHashCode()){
+      size_t result = 4;
+      arrow::internal::hash_combine(result,ToString());
+      hash_code_ = result;
+      SetHasEvalHashCode();
+    }
+    return hash_code_;
+  }
+
  private:
   LiteralHolder holder_;
   bool is_null_;
+  size_t hash_code_;
 };
 
 /// \brief Node in the expression tree, representing an arrow field.
@@ -117,8 +140,19 @@ class GANDIVA_EXPORT FieldNode : public Node {
     return "(" + field()->type()->ToString() + ") " + field()->name();
   }
 
+  size_t HashCode() override{
+    if(!GetHasEvalHashCode()){
+      size_t result = 4;
+      arrow::internal::hash_combine(result,ToString());
+      hash_code_ = result;
+      SetHasEvalHashCode();
+    }
+    return hash_code_;
+  }
+
  private:
   FieldPtr field_;
+  size_t hash_code_;
 };
 
 /// \brief Node in the expression tree, representing a function.
@@ -149,9 +183,23 @@ class GANDIVA_EXPORT FunctionNode : public Node {
     return ss.str();
   }
 
+  size_t HashCode() override{
+    if(!GetHasEvalHashCode()) {
+      size_t result = 4;
+      for (auto& child : children_) {
+        auto child_hash_code = child->HashCode();
+        arrow::internal::hash_combine(result, child_hash_code);
+      }
+      hash_code_ = result;
+      SetHasEvalHashCode();
+    }
+    return hash_code_;
+  }
+
  private:
   FuncDescriptorPtr descriptor_;
   NodeVector children_;
+  size_t hash_code_;
 };
 
 inline FunctionNode::FunctionNode(const std::string& name, const NodeVector& children,
@@ -188,10 +236,26 @@ class GANDIVA_EXPORT IfNode : public Node {
     return ss.str();
   }
 
+  size_t HashCode() override{
+    if(!GetHasEvalHashCode()) {
+      size_t result = 4;
+      auto condition_hash_code = condition_->HashCode();
+      arrow::internal::hash_combine(result,condition_hash_code);
+      auto then_hash_code = then_node_->HashCode();
+      arrow::internal::hash_combine(result,then_hash_code);
+      auto else_hash_code = else_node_->HashCode();
+      arrow::internal::hash_combine(result,else_hash_code);
+      hash_code_ = result;
+      SetHasEvalHashCode();
+    }
+    return hash_code_;
+  }
+
  private:
   NodePtr condition_;
   NodePtr then_node_;
   NodePtr else_node_;
+  size_t hash_code_;
 };
 
 /// \brief Node in the expression tree, representing an and/or boolean expression.
@@ -225,9 +289,23 @@ class GANDIVA_EXPORT BooleanNode : public Node {
     return ss.str();
   }
 
+  size_t HashCode() override{
+    if(!GetHasEvalHashCode()) {
+      size_t result = 4;
+      for (auto& child : children_) {
+        auto child_hash_code = child->HashCode();
+        arrow::internal::hash_combine(result, child_hash_code);
+      }
+      hash_code_ = result;
+      SetHasEvalHashCode();
+    }
+    return hash_code_;
+  }
+
  private:
   ExprType expr_type_;
   NodeVector children_;
+  size_t hash_code_;
 };
 
 /// \brief Node in expression tree, representing an in expression.
@@ -263,6 +341,10 @@ class InExpressionNode : public Node {
     }
     ss << ")";
     return ss.str();
+  }
+
+  size_t HashCode() override{
+    return eval_expr()->HashCode();
   }
 
  private:
@@ -307,6 +389,10 @@ class InExpressionNode<gandiva::DecimalScalar128> : public Node {
     }
     ss << ")";
     return ss.str();
+  }
+
+  size_t HashCode() override{
+    return eval_expr()->HashCode();
   }
 
  private:

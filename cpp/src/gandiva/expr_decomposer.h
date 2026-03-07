@@ -61,6 +61,9 @@ class GANDIVA_EXPORT ExprDecomposer : public NodeVisitor {
   FRIEND_TEST(TestExprDecomposer, TestIfInCondition);
   FRIEND_TEST(TestExprDecomposer, TestFunctionBetweenNestedIf);
   FRIEND_TEST(TestExprDecomposer, TestComplexIfCondition);
+  FRIEND_TEST(TestExprDecomposer, TestCSENodeKeyNoDelimiterCollision);
+  FRIEND_TEST(TestExprDecomposer, TestDecomposeCSEReuseIdenticalSubtrees);
+  FRIEND_TEST(TestExprDecomposer, TestDecomposeCSENoReuseForDistinctSubtrees);
 
   Status Visit(const FieldNode& node) override;
   Status Visit(const FunctionNode& node) override;

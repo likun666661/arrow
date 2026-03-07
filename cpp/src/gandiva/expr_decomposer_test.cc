@@ -29,6 +29,19 @@ namespace gandiva {
 
 using arrow::int32;
 
+namespace {
+
+NodePtr MakeFieldNode(const std::string& name) {
+  return std::make_shared<FieldNode>(arrow::field(name, int32()));
+}
+
+NodePtr MakeAddNode(const NodePtr& left, const NodePtr& right) {
+  NodeVector children{left, right};
+  return std::make_shared<FunctionNode>("add", children, int32());
+}
+
+}  // namespace
+
 class TestExprDecomposer : public ::testing::Test {
  protected:
   std::shared_ptr<FunctionRegistry> registry_ = default_function_registry();
@@ -403,6 +416,58 @@ TEST_F(TestExprDecomposer, TestComplexIfCondition) {
   }
   EXPECT_FALSE(decomposer.PopElseEntry(node_a));
   EXPECT_TRUE(decomposer.if_entries_stack_.empty());
+}
+
+TEST_F(TestExprDecomposer, TestCSENodeKeyNoDelimiterCollision) {
+  Annotator annotator;
+  ExprDecomposer decomposer(*registry_, annotator);
+
+  auto left =
+      MakeAddNode(MakeFieldNode("A"), MakeFieldNode("B:int32|field:C"));
+  auto right =
+      MakeAddNode(MakeFieldNode("A:int32|field:B"), MakeFieldNode("C"));
+
+  auto left_key = decomposer.BuildCSENodeKey(*left);
+  auto right_key = decomposer.BuildCSENodeKey(*right);
+
+  EXPECT_FALSE(left_key.empty());
+  EXPECT_FALSE(right_key.empty());
+  EXPECT_NE(left_key, right_key);
+}
+
+TEST_F(TestExprDecomposer, TestDecomposeCSEReuseIdenticalSubtrees) {
+  Annotator annotator;
+  ExprDecomposer decomposer(*registry_, annotator);
+
+  auto shared_subtree = MakeAddNode(MakeFieldNode("f0"), MakeFieldNode("f1"));
+  auto root = MakeAddNode(shared_subtree, shared_subtree);
+
+  ValueValidityPairPtr out;
+  auto status = decomposer.Decompose(*root, &out);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  auto outer = std::dynamic_pointer_cast<NonNullableFuncDex>(out->value_expr());
+  ASSERT_NE(outer, nullptr);
+  ASSERT_EQ(outer->args().size(), 2);
+  EXPECT_EQ(outer->args()[0].get(), outer->args()[1].get());
+}
+
+TEST_F(TestExprDecomposer, TestDecomposeCSENoReuseForDistinctSubtrees) {
+  Annotator annotator;
+  ExprDecomposer decomposer(*registry_, annotator);
+
+  auto left = MakeAddNode(MakeFieldNode("A"), MakeFieldNode("B:int32|field:C"));
+  auto right = MakeAddNode(MakeFieldNode("A:int32|field:B"), MakeFieldNode("C"));
+  auto root = MakeAddNode(left, right);
+
+  ValueValidityPairPtr out;
+  auto status = decomposer.Decompose(*root, &out);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  auto outer = std::dynamic_pointer_cast<NonNullableFuncDex>(out->value_expr());
+  ASSERT_NE(outer, nullptr);
+  ASSERT_EQ(outer->args().size(), 2);
+  EXPECT_NE(outer->args()[0].get(), outer->args()[1].get());
 }
 
 }  // namespace gandiva

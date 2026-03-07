@@ -24,8 +24,10 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <string>
 
 #include "arrow/memory_pool.h"
+#include "gandiva/configuration.h"
 #include "gandiva/function_registry.h"
 #include "gandiva/literal_holder.h"
 #include "gandiva/node.h"
@@ -38,6 +40,27 @@ using arrow::boolean;
 using arrow::float32;
 using arrow::int32;
 using arrow::int64;
+
+namespace {
+
+int CountSubstr(const std::string& text, const std::string& pattern) {
+  if (pattern.empty()) {
+    return 0;
+  }
+  int count = 0;
+  std::size_t pos = 0;
+  while (true) {
+    pos = text.find(pattern, pos);
+    if (pos == std::string::npos) {
+      break;
+    }
+    ++count;
+    pos += pattern.size();
+  }
+  return count;
+}
+
+}  // namespace
 
 class TestProjector : public ::testing::Test {
  public:
@@ -193,6 +216,60 @@ TEST_F(TestProjector, TestProjectCacheLiteral) {
   ASSERT_OK(Projector::Make(schema, {expr1}, TestConfiguration(), &projector1));
 
   EXPECT_NE(projector0.get(), projector1.get());
+}
+
+TEST_F(TestProjector, TestCommonSubexpressionCodegen) {
+  auto f0 = field("cse_f0", int32());
+  auto f1 = field("cse_f1", int32());
+  auto schema = arrow::schema({f0, f1});
+  auto out = field("cse_out", int32());
+
+  auto add_left = TreeExprBuilder::MakeFunction(
+      "add", {TreeExprBuilder::MakeField(f0), TreeExprBuilder::MakeField(f1)}, int32());
+  auto add_right = TreeExprBuilder::MakeFunction(
+      "add", {TreeExprBuilder::MakeField(f0), TreeExprBuilder::MakeField(f1)}, int32());
+  auto root = TreeExprBuilder::MakeFunction("add", {add_left, add_right}, int32());
+  auto expr = TreeExprBuilder::MakeExpression(root, out);
+
+  auto configuration = ConfigurationBuilder().build(false);
+  configuration->set_dump_ir(true);
+
+  std::shared_ptr<Projector> projector;
+  ASSERT_OK(Projector::Make(schema, {expr}, configuration, &projector));
+  EXPECT_FALSE(projector->GetBuiltFromCache());
+
+  const auto& ir = projector->DumpIR();
+  // 1 outer add + 1 shared inner add (CSE), instead of 3 adds.
+  EXPECT_EQ(CountSubstr(ir, "call i32 @add_int32_int32"), 2);
+}
+
+TEST_F(TestProjector, TestCommonSubexpressionCodegenKeyCollisionRegression) {
+  // These two children used to collide under delimiter-based CSE keys:
+  // add(A, B:int32|field:C) and add(A:int32|field:B, C).
+  auto f_a = field("A", int32());
+  auto f_b = field("B:int32|field:C", int32());
+  auto f_c = field("A:int32|field:B", int32());
+  auto f_d = field("C", int32());
+  auto schema = arrow::schema({f_a, f_b, f_c, f_d});
+  auto out = field("cse_collision_out", int32());
+
+  auto add_left = TreeExprBuilder::MakeFunction(
+      "add", {TreeExprBuilder::MakeField(f_a), TreeExprBuilder::MakeField(f_b)}, int32());
+  auto add_right = TreeExprBuilder::MakeFunction(
+      "add", {TreeExprBuilder::MakeField(f_c), TreeExprBuilder::MakeField(f_d)}, int32());
+  auto root = TreeExprBuilder::MakeFunction("add", {add_left, add_right}, int32());
+  auto expr = TreeExprBuilder::MakeExpression(root, out);
+
+  auto configuration = ConfigurationBuilder().build(false);
+  configuration->set_dump_ir(true);
+
+  std::shared_ptr<Projector> projector;
+  ASSERT_OK(Projector::Make(schema, {expr}, configuration, &projector));
+  EXPECT_FALSE(projector->GetBuiltFromCache());
+
+  const auto& ir = projector->DumpIR();
+  // 2 distinct inner adds + 1 outer add.
+  EXPECT_EQ(CountSubstr(ir, "call i32 @add_int32_int32"), 3);
 }
 
 TEST_F(TestProjector, TestProjectCacheDecimalCast) {

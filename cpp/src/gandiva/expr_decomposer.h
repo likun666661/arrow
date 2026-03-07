@@ -21,6 +21,7 @@
 #include <memory>
 #include <stack>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "gandiva/arrow.h"
@@ -33,6 +34,7 @@ namespace gandiva {
 
 class FunctionRegistry;
 class Annotator;
+class NativeFunction;
 
 /// \brief Decomposes an expression tree to separate out the validity and
 /// value expressions.
@@ -77,6 +79,13 @@ class GANDIVA_EXPORT ExprDecomposer : public NodeVisitor {
 
   // Optimize a function node, if possible.
   const FunctionNode TryOptimize(const FunctionNode& node);
+
+  // Build a structural key for a node when it is safe to reuse it for CSE.
+  // Returns empty string if node should not participate in CSE.
+  std::string BuildCSENodeKey(const Node& node);
+
+  // Whether a native function is safe to reuse as a common subexpression.
+  bool CanReuseFunctionForCSE(const NativeFunction& native_function) const;
 
   enum StackEntryType { kStackEntryCondition, kStackEntryThen, kStackEntryElse };
 
@@ -126,6 +135,7 @@ class GANDIVA_EXPORT ExprDecomposer : public NodeVisitor {
   std::stack<std::unique_ptr<IfStackEntry>> if_entries_stack_;
   ValueValidityPairPtr result_;
   bool nested_if_else_;
+  std::unordered_map<std::string, ValueValidityPairPtr> cse_cache_;
 };
 
 }  // namespace gandiva

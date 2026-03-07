@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "arrow/util/macros.h"
@@ -177,6 +178,15 @@ class GANDIVA_EXPORT LLVMGenerator {
     // Clear the bit in the local bitmap, if is_valid is 'false'
     void ClearLocalBitMapIfNotValid(int local_bitmap_idx, llvm::Value* is_valid);
 
+    // Reuse previously generated value in the same basic block only.
+    bool TryGetCachedValue(const Dex& dex);
+    void CacheValue(const Dex& dex);
+
+    struct CachedValue {
+      LValuePtr value;
+      llvm::BasicBlock* block;
+    };
+
     LLVMGenerator* generator_;
     LValuePtr result_;
     llvm::Function* function_;
@@ -188,6 +198,7 @@ class GANDIVA_EXPORT LLVMGenerator {
     llvm::Value* arg_context_ptr_;
     llvm::Value* loop_var_;
     bool has_arena_allocs_;
+    std::unordered_map<const Dex*, CachedValue> value_cache_;
   };
 
   // Generate the code for one expression for default mode, with the output of

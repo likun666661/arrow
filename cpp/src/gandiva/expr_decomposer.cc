@@ -17,6 +17,7 @@
 
 #include "gandiva/expr_decomposer.h"
 
+#include <cstdint>
 #include <memory>
 #include <stack>
 #include <string>
@@ -61,6 +62,70 @@ const FunctionNode ExprDecomposer::TryOptimize(const FunctionNode& node) {
   }
 }
 
+bool ExprDecomposer::CanReuseFunctionForCSE(
+    const NativeFunction& native_function) const {
+  // Keep CSE conservative: only reuse pure/side-effect-free functions.
+  if (native_function.NeedsContext() || native_function.NeedsFunctionHolder() ||
+      native_function.CanReturnErrors()) {
+    return false;
+  }
+  if (native_function.result_nullable_type() == kResultNullInternal) {
+    return false;
+  }
+  return true;
+}
+
+std::string ExprDecomposer::BuildCSENodeKey(const Node& node) {
+  auto append_uint32 = [](std::string* out, uint32_t value) {
+    // Binary length-prefix encoding avoids delimiter collisions in keys.
+    out->push_back(static_cast<char>((value >> 0) & 0xFF));
+    out->push_back(static_cast<char>((value >> 8) & 0xFF));
+    out->push_back(static_cast<char>((value >> 16) & 0xFF));
+    out->push_back(static_cast<char>((value >> 24) & 0xFF));
+  };
+  auto append_string = [&append_uint32](std::string* out, const std::string& value) {
+    append_uint32(out, static_cast<uint32_t>(value.size()));
+    out->append(value);
+  };
+  auto append_type = [&append_string](std::string* out, const DataTypePtr& type) {
+    append_string(out, type == NULLPTR ? std::string("<nulltype>") : type->ToString());
+  };
+
+  std::string key;
+  if (const auto* field_node = dynamic_cast<const FieldNode*>(&node)) {
+    key.push_back('F');
+    append_string(&key, field_node->field()->name());
+    append_type(&key, node.return_type());
+  } else if (const auto* literal_node = dynamic_cast<const LiteralNode*>(&node)) {
+    key.push_back('L');
+    append_type(&key, node.return_type());
+    append_string(&key, literal_node->ToString());
+  } else if (const auto* fn_node = dynamic_cast<const FunctionNode*>(&node)) {
+    auto desc = fn_node->descriptor();
+    FunctionSignature signature(desc->name(), desc->params(), desc->return_type());
+    const NativeFunction* native_function = registry_.LookupSignature(signature);
+    if (native_function == nullptr || !CanReuseFunctionForCSE(*native_function)) {
+      key = "";
+    } else {
+      key.push_back('N');
+      append_string(&key, native_function->pc_name());
+      append_type(&key, desc->return_type());
+      append_uint32(&key, static_cast<uint32_t>(fn_node->children().size()));
+      for (const auto& child : fn_node->children()) {
+        auto child_key = BuildCSENodeKey(*child);
+        if (child_key.empty()) {
+          key = "";
+          break;
+        }
+        append_string(&key, child_key);
+      }
+    }
+  } else {
+    key = "";
+  }
+  return key;
+}
+
 // Decompose a field node - wherever possible, merge the validity vectors of the
 // child nodes.
 Status ExprDecomposer::Visit(const FunctionNode& in_node) {
@@ -69,6 +134,19 @@ Status ExprDecomposer::Visit(const FunctionNode& in_node) {
   FunctionSignature signature(desc->name(), desc->params(), desc->return_type());
   const NativeFunction* native_function = registry_.LookupSignature(signature);
   DCHECK(native_function) << "Missing Signature " << signature.ToString();
+
+  // Try to reuse already decomposed subexpression when safe.
+  std::string cse_key;
+  if (CanReuseFunctionForCSE(*native_function)) {
+    cse_key = BuildCSENodeKey(node);
+    if (!cse_key.empty()) {
+      auto found = cse_cache_.find(cse_key);
+      if (found != cse_cache_.end()) {
+        result_ = found->second;
+        return Status::OK();
+      }
+    }
+  }
 
   // decompose the children.
   std::vector<ValueValidityPairPtr> args;
@@ -118,6 +196,10 @@ Status ExprDecomposer::Visit(const FunctionNode& in_node) {
     auto value_dex = std::make_shared<NullableInternalFuncDex>(
         desc, native_function, holder, holder_idx, args, local_bitmap_idx);
     result_ = std::make_shared<ValueValidityPair>(validity_dex, value_dex);
+  }
+
+  if (!cse_key.empty()) {
+    cse_cache_.emplace(cse_key, result_);
   }
   return Status::OK();
 }

@@ -162,6 +162,14 @@ std::string DumpModuleIR(const llvm::Module& module) {
   return ir;
 }
 
+bool ShouldCaptureModuleIR(const Configuration& conf) {
+  if (conf.dump_ir()) {
+    return true;
+  }
+  auto maybe_ir_dump_file = arrow::internal::GetEnvVar("GANDIVA_IR_DUMP_FILE");
+  return maybe_ir_dump_file.ok() && !maybe_ir_dump_file->empty();
+}
+
 void AddAbsoluteSymbol(llvm::orc::LLJIT& lljit, const std::string& name,
                        void* function_ptr) {
   llvm::orc::MangleAndInterner mangle(lljit.getExecutionSession(), lljit.getDataLayout());
@@ -559,7 +567,7 @@ Status Engine::FinalizeModule() {
     // print the module IR and save it for later use if IR dumping is needed
     // since the module will be moved to construct LLJIT instance, and it is not
     // available after LLJIT instance is constructed
-    if (conf_->dump_ir()) {
+    if (ShouldCaptureModuleIR(*conf_)) {
       module_ir_ = DumpModuleIR(*module_);
     }
 

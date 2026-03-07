@@ -17,10 +17,12 @@
 
 #include "gandiva/llvm_generator.h"
 
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "arrow/util/io_util.h"
 #include "arrow/util/logging_internal.h"
 #include "gandiva/bitmap_accumulator.h"
 #include "gandiva/decimal_ir.h"
@@ -31,6 +33,33 @@
 #include "gandiva/lvalue.h"
 
 namespace gandiva {
+
+namespace {
+
+std::string GetIRDumpFilePathFromEnv() {
+  auto maybe_path = arrow::internal::GetEnvVar("GANDIVA_IR_DUMP_FILE");
+  if (!maybe_path.ok()) {
+    return "";
+  }
+  return *maybe_path;
+}
+
+Status DumpIRToFile(const std::string& path, const std::string& ir) {
+  if (path.empty()) {
+    return Status::OK();
+  }
+
+  std::ofstream out(path, std::ios::out | std::ios::trunc);
+  ARROW_RETURN_IF(!out.is_open(),
+                  Status::IOError("Failed to open IR dump file: ", path));
+  out << ir;
+  out.flush();
+  ARROW_RETURN_IF(!out.good(),
+                  Status::IOError("Failed to write IR dump file: ", path));
+  return Status::OK();
+}
+
+}  // namespace
 
 #define ADD_TRACE(...)     \
   if (enable_ir_traces_) { \
@@ -107,6 +136,11 @@ Status LLVMGenerator::Build(const ExpressionVector& exprs, SelectionVector::Mode
     ARROW_ASSIGN_OR_RAISE(auto fn_ptr, engine_->CompiledFunction(fn_name));
     auto jit_fn = reinterpret_cast<EvalFunc>(fn_ptr);
     compiled_expr->SetJITFunction(selection_vector_mode_, jit_fn);
+  }
+
+  const auto ir_dump_file = GetIRDumpFilePathFromEnv();
+  if (!ir_dump_file.empty() && !cached_) {
+    ARROW_RETURN_NOT_OK(DumpIRToFile(ir_dump_file, engine_->ir()));
   }
 
   return Status::OK();
@@ -591,6 +625,22 @@ LLVMGenerator::Visitor::Visitor(LLVMGenerator* generator, llvm::Function* functi
   ADD_VISITOR_TRACE("Iteration %T", loop_var);
 }
 
+bool LLVMGenerator::Visitor::TryGetCachedValue(const Dex& dex) {
+  auto cached = value_cache_.find(&dex);
+  if (cached == value_cache_.end()) {
+    return false;
+  }
+  if (cached->second.block != ir_builder()->GetInsertBlock()) {
+    return false;
+  }
+  result_ = cached->second.value;
+  return true;
+}
+
+void LLVMGenerator::Visitor::CacheValue(const Dex& dex) {
+  value_cache_[&dex] = CachedValue{result_, ir_builder()->GetInsertBlock()};
+}
+
 void LLVMGenerator::Visitor::Visit(const VectorReadFixedLenValueDex& dex) {
   llvm::IRBuilder<>* builder = ir_builder();
   auto types = generator_->types();
@@ -784,6 +834,12 @@ void LLVMGenerator::Visitor::Visit(const LiteralDex& dex) {
 }
 
 void LLVMGenerator::Visitor::Visit(const NonNullableFuncDex& dex) {
+  if (TryGetCachedValue(dex)) {
+    ADD_VISITOR_TRACE("reuse cached function value for " +
+                      dex.func_descriptor()->name());
+    return;
+  }
+
   const std::string& function_name = dex.func_descriptor()->name();
   ADD_VISITOR_TRACE("visit NonNullableFunc base function " + function_name);
 
@@ -834,6 +890,7 @@ void LLVMGenerator::Visitor::Visit(const NonNullableFuncDex& dex) {
     // fast path : invoke function without computing validities.
     result_ = BuildFunctionCall(native_function, arrow_return_type, &params);
   }
+  CacheValue(dex);
 }
 
 void LLVMGenerator::Visitor::Visit(const NullableNeverFuncDex& dex) {

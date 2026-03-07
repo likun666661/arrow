@@ -18,6 +18,7 @@
 #include "gandiva/llvm_generator.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -30,6 +31,44 @@
 #include "gandiva/tests/test_util.h"
 
 namespace gandiva {
+
+namespace {
+
+int CountSubstr(const std::string& text, const std::string& pattern) {
+  if (pattern.empty()) {
+    return 0;
+  }
+  int count = 0;
+  std::size_t pos = 0;
+  while (true) {
+    pos = text.find(pattern, pos);
+    if (pos == std::string::npos) {
+      break;
+    }
+    ++count;
+    pos += pattern.size();
+  }
+  return count;
+}
+
+ValueValidityPairPtr MakeInt32InputPair(Annotator* annotator, const std::string& field_name) {
+  auto field = std::make_shared<arrow::Field>(field_name, arrow::int32());
+  auto desc = annotator->CheckAndAddInputFieldDescriptor(field);
+  auto validity_dex = std::make_shared<VectorReadValidityDex>(desc);
+  auto value_dex = std::make_shared<VectorReadFixedLenValueDex>(desc);
+  return std::make_shared<ValueValidityPair>(validity_dex, value_dex);
+}
+
+DexVector MergeValidities(const ValueValidityPairPtr& left, const ValueValidityPairPtr& right) {
+  DexVector validities;
+  validities.insert(validities.end(), left->validity_exprs().begin(),
+                    left->validity_exprs().end());
+  validities.insert(validities.end(), right->validity_exprs().begin(),
+                    right->validity_exprs().end());
+  return validities;
+}
+
+}  // namespace
 
 typedef int64_t (*add_vector_func_t)(int64_t* elements, int nelements);
 
@@ -150,6 +189,93 @@ TEST_F(TestLLVMGenerator, VerifyExtendedCFunctions) {
   VerifyFunctionMapping("multiply_by_n_int32_int32", [](auto registry) {
     return TestConfigWithHolderFunction(std::move(registry));
   });
+}
+
+TEST_F(TestLLVMGenerator, TestReuseSameNonNullableDexPointer) {
+  auto config = ConfigurationBuilder().build(false);
+  config->set_dump_ir(true);
+  ASSERT_OK_AND_ASSIGN(auto generator, LLVMGenerator::Make(config, false));
+  Annotator annotator;
+
+  auto pair0 = MakeInt32InputPair(&annotator, "f0");
+  auto pair1 = MakeInt32InputPair(&annotator, "f1");
+
+  DataTypeVector params{arrow::int32(), arrow::int32()};
+  auto func_desc = std::make_shared<FuncDescriptor>("add", params, arrow::int32());
+  FunctionSignature signature(func_desc->name(), func_desc->params(),
+                              func_desc->return_type());
+  const NativeFunction* native_func =
+      generator->function_registry_->LookupSignature(signature);
+
+  auto make_add_dex = [&](const ValueValidityPairPtr& left,
+                          const ValueValidityPairPtr& right) {
+    std::vector<ValueValidityPairPtr> pairs{left, right};
+    return std::make_shared<NonNullableFuncDex>(func_desc, native_func,
+                                                FunctionHolderPtr(nullptr), -1, pairs);
+  };
+
+  auto inner_dex = make_add_dex(pair0, pair1);
+  auto inner_pair =
+      std::make_shared<ValueValidityPair>(MergeValidities(pair0, pair1), inner_dex);
+  auto outer_dex = make_add_dex(inner_pair, inner_pair);
+
+  auto field_out = std::make_shared<arrow::Field>("out", arrow::int32());
+  auto desc_out = annotator.CheckAndAddInputFieldDescriptor(field_out);
+
+  std::string fn_name = "llvm_gen_test_add_reuse_same_ptr";
+  ASSERT_OK(generator->engine_->LoadFunctionIRs());
+  ASSERT_OK(generator->CodeGenExprValue(outer_dex, 6, desc_out, 0, fn_name,
+                                        SelectionVector::MODE_NONE));
+  ASSERT_OK(generator->engine_->FinalizeModule());
+
+  const auto& ir = generator->engine_->ir();
+  // 1 inner add + 1 outer add (same inner Dex pointer reused).
+  EXPECT_EQ(CountSubstr(ir, "call i32 @add_int32_int32"), 2);
+}
+
+TEST_F(TestLLVMGenerator, TestDoNotReuseDifferentNonNullableDexPointers) {
+  auto config = ConfigurationBuilder().build(false);
+  config->set_dump_ir(true);
+  ASSERT_OK_AND_ASSIGN(auto generator, LLVMGenerator::Make(config, false));
+  Annotator annotator;
+
+  auto pair0 = MakeInt32InputPair(&annotator, "f0");
+  auto pair1 = MakeInt32InputPair(&annotator, "f1");
+
+  DataTypeVector params{arrow::int32(), arrow::int32()};
+  auto func_desc = std::make_shared<FuncDescriptor>("add", params, arrow::int32());
+  FunctionSignature signature(func_desc->name(), func_desc->params(),
+                              func_desc->return_type());
+  const NativeFunction* native_func =
+      generator->function_registry_->LookupSignature(signature);
+
+  auto make_add_dex = [&](const ValueValidityPairPtr& left,
+                          const ValueValidityPairPtr& right) {
+    std::vector<ValueValidityPairPtr> pairs{left, right};
+    return std::make_shared<NonNullableFuncDex>(func_desc, native_func,
+                                                FunctionHolderPtr(nullptr), -1, pairs);
+  };
+
+  auto inner_dex_left = make_add_dex(pair0, pair1);
+  auto inner_dex_right = make_add_dex(pair0, pair1);
+  auto inner_pair_left =
+      std::make_shared<ValueValidityPair>(MergeValidities(pair0, pair1), inner_dex_left);
+  auto inner_pair_right =
+      std::make_shared<ValueValidityPair>(MergeValidities(pair0, pair1), inner_dex_right);
+  auto outer_dex = make_add_dex(inner_pair_left, inner_pair_right);
+
+  auto field_out = std::make_shared<arrow::Field>("out", arrow::int32());
+  auto desc_out = annotator.CheckAndAddInputFieldDescriptor(field_out);
+
+  std::string fn_name = "llvm_gen_test_add_reuse_diff_ptr";
+  ASSERT_OK(generator->engine_->LoadFunctionIRs());
+  ASSERT_OK(generator->CodeGenExprValue(outer_dex, 6, desc_out, 0, fn_name,
+                                        SelectionVector::MODE_NONE));
+  ASSERT_OK(generator->engine_->FinalizeModule());
+
+  const auto& ir = generator->engine_->ir();
+  // 2 distinct inner adds + 1 outer add.
+  EXPECT_EQ(CountSubstr(ir, "call i32 @add_int32_int32"), 3);
 }
 
 }  // namespace gandiva

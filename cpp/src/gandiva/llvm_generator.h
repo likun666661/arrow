@@ -93,6 +93,8 @@ class GANDIVA_EXPORT LLVMGenerator {
   FRIEND_TEST(TestLLVMGenerator, VerifyPCFunctions);
   FRIEND_TEST(TestLLVMGenerator, TestAdd);
   FRIEND_TEST(TestLLVMGenerator, TestNullInternal);
+  FRIEND_TEST(TestLLVMGenerator, TestReuseSameNonNullableDexPointer);
+  FRIEND_TEST(TestLLVMGenerator, TestDoNotReuseDifferentNonNullableDexPointers);
   friend class TestLLVMGenerator;
 
   llvm::LLVMContext* context() { return engine_->context(); }
